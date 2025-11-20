@@ -5,5 +5,6 @@
 USVONavigationSettings::USVONavigationSettings()
 {
     bNavigationAutoUpdateEnabled = true;
+    bSmoothPaths = true;
     DefaultRaycasterClass = USVORayCaster_OctreeTraversal::StaticClass();
 }

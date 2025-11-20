@@ -1,48 +1,44 @@
 #include "SVONavigationData.h"
 #include "SVOVolumeNavigationData.h"
-#include "PathFinding/SVONavigationQueryFilterImpl.h"
 #include "PathFinding/SVOPathFinder.h"
-#include "NavMesh/NavMeshPath.h"
 #include "PathFinding/SVONavigationPath.h"
+#include "Core/SVONavigationDataChunkActor.h"
 
 FNavLocation ASVONavigationData::GetRandomPoint( FSharedConstNavQueryFilter /*filter*/, const UObject * /*querier*/ ) const
 {
+    // Gather all sources of volume data (Legacy + ChunkActors)
+    TArray<const FSVOVolumeNavigationData*> AllVolumes;
+    
+    for (const auto& VolumeData : VolumeNavigationData)
+    {
+        if (VolumeData.GetData().IsValid())
+        {
+            AllVolumes.Add(&VolumeData);
+        }
+    }
+
+    for (const auto& ChunkActor : ChunkActors)
+    {
+        if (ChunkActor && ChunkActor->GetVolumeNavigationData().GetData().IsValid())
+        {
+            AllVolumes.Add(&ChunkActor->GetVolumeNavigationData());
+        }
+    }
+
     FNavLocation result;
-
-    const auto navigation_bounds_num = VolumeNavigationData.Num();
-
-    if ( navigation_bounds_num == 0 )
+    if ( AllVolumes.Num() == 0 )
     {
         return result;
     }
 
-    TArray< int > navigation_bounds_indices;
-    navigation_bounds_indices.Reserve( VolumeNavigationData.Num() );
+    const int32 Index = FMath::RandRange(0, AllVolumes.Num() - 1);
+    const auto* SelectedVolume = AllVolumes[Index];
 
-    for ( auto index = 0; index < navigation_bounds_num; index++ )
+    const auto random_point = SelectedVolume->GetRandomPoint();
+    if ( random_point.IsSet() )
     {
-        navigation_bounds_indices.Add( index );
+        result = random_point.GetValue();
     }
-
-    // Shuffle the array
-    for ( int index = navigation_bounds_indices.Num() - 1; index > 0; --index )
-    {
-        const auto new_index = FMath::RandRange( 0, index );
-        Swap( navigation_bounds_indices[ index ], navigation_bounds_indices[ new_index ] );
-    }
-
-    do
-    {
-        const auto index = navigation_bounds_indices.Pop( EAllowShrinking::No );
-        const auto & volume_navigation_data = VolumeNavigationData[ index ];
-
-        const auto random_point = volume_navigation_data.GetRandomPoint();
-        if ( random_point.IsSet() )
-        {
-            result = random_point.GetValue();
-            break;
-        }
-    } while ( navigation_bounds_indices.Num() > 0 );
 
     return result;
 }
@@ -76,31 +72,35 @@ bool ASVONavigationData::FindMoveAlongSurface( const FNavLocation & start_locati
 
 bool ASVONavigationData::ProjectPoint( const FVector & point, FNavLocation & out_location, const FVector & extent, FSharedConstNavQueryFilter filter, const UObject * querier ) const
 {
-    if (VolumeNavigationData.IsEmpty())
-    {
-        return false;
-    }
-
-    // 1. Find the correct volume to search in.
-    const FSVOVolumeNavigationData* VolumeToSearch = nullptr;
-    for (const auto& Volume : VolumeNavigationData)
-    {
-        if (Volume.GetData().GetNavigationBounds().IsInside(point))
-        {
-            VolumeToSearch = &Volume;
-            break;
-        }
-    }
-
-    // Fallback: If the point is outside all volumes, find the closest volume to search within.
-    if (!VolumeToSearch)
+    const FSVOVolumeNavigationData* VolumeToSearch = GetVolumeNavigationDataContainingPoints({point});
+    
+    if ( !VolumeToSearch )
     {
         float MinDistSq = -1.0f;
+        
+        // Check Legacy Volumes
         for (const auto& Volume : VolumeNavigationData)
         {
-            const FBox& BoundingBox = Volume.GetData().GetNavigationBounds();
-            if (!BoundingBox.IsValid)
-                continue;
+            // Use VolumeBounds for tighter fit check, NavigationBounds for SVO logic
+            const FBox& BoundingBox = Volume.GetVolumeBounds();
+            if (!BoundingBox.IsValid) continue;
+
+            const float DistSq = BoundingBox.ComputeSquaredDistanceToPoint(point);
+            if (MinDistSq < 0 || DistSq < MinDistSq)
+            {
+                MinDistSq = DistSq;
+                VolumeToSearch = &Volume;
+            }
+        }
+
+        // Check World Partition Chunks
+        for (const auto& Chunk : ChunkActors)
+        {
+            if (!Chunk) continue;
+            const FSVOVolumeNavigationData& Volume = Chunk->GetVolumeNavigationData();
+            const FBox& BoundingBox = Volume.GetVolumeBounds(); // Use tight bounds
+            
+            if (!BoundingBox.IsValid) continue;
 
             const float DistSq = BoundingBox.ComputeSquaredDistanceToPoint(point);
             if (MinDistSq < 0 || DistSq < MinDistSq)
@@ -116,9 +116,8 @@ bool ASVONavigationData::ProjectPoint( const FVector & point, FNavLocation & out
         return false;
     }
 
-    // 2. Clamp the search point to be within the volume's bounds.
     FVector StartPoint = point;
-    const FBox& VolumeBounds = VolumeToSearch->GetData().GetNavigationBounds();
+    const FBox& VolumeBounds = VolumeToSearch->GetNavigationBounds(); // Use SVO bounds for internal logic
     if (!VolumeBounds.IsInside(StartPoint))
     {
         StartPoint = VolumeBounds.GetClosestPointTo(StartPoint);
@@ -237,8 +236,6 @@ ENavigationQueryResult::Type ASVONavigationData::CalcPathLength( const FVector &
 
 ENavigationQueryResult::Type ASVONavigationData::CalcPathLengthAndCost( const FVector & path_start, const FVector & path_end, FVector::FReal & out_path_length, FVector::FReal & out_path_cost, FSharedConstNavQueryFilter filter, const UObject * querier ) const
 {
-    ENavigationQueryResult::Type result = ENavigationQueryResult::Invalid;
-
     if ( ( path_start - path_end ).IsNearlyZero() )
     {
         out_path_length = 0.f;
@@ -254,15 +251,15 @@ ENavigationQueryResult::Type ASVONavigationData::CalcPathLengthAndCost( const FV
 
     const TSharedRef< FSVONavigationPath > navigation_path = MakeShareable( new FSVONavigationPath() );
 
-    result = FSVOPathFinder::GetPath( navigation_path.Get(), *this, path_start, path_end, filter );
+    const ENavigationQueryResult::Type Result = FSVOPathFinder::GetPath(navigation_path.Get(), *this, path_start, path_end, filter);
 
-    if ( result == ENavigationQueryResult::Success || ( result == ENavigationQueryResult::Fail && navigation_path->IsPartial() ) )
+    if ( Result == ENavigationQueryResult::Success || ( Result == ENavigationQueryResult::Fail && navigation_path->IsPartial() ) )
     {
         out_path_length = navigation_path->GetLength();
         out_path_cost = navigation_path->GetCost();
     }
 
-    return result;
+    return Result;
 }
 
 bool ASVONavigationData::DoesNodeContainLocation( NavNodeRef node_ref, const FVector & world_space_location ) const
@@ -273,12 +270,29 @@ bool ASVONavigationData::DoesNodeContainLocation( NavNodeRef node_ref, const FVe
         return false;
     }
 
+    // Check Legacy Volumes
     for (const auto& Volume : VolumeNavigationData)
     {
-        // A simple check to see if the location is even in this volume. This isn't perfect
-        // as a node from one volume could technically contain a point just inside another,
-        // but it's a reasonable optimization.
-        if (Volume.GetData().GetNavigationBounds().IsInside(world_space_location))
+        if (Volume.GetNavigationBounds().IsInside(world_space_location))
+        {
+            const FVector NodeLocation = Volume.GetNodePositionFromAddress(Address, true);
+            const float NodeExtent = Volume.GetNodeExtentFromNodeAddress(Address);
+            const FBox NodeBounds = FBox::BuildAABB(NodeLocation, FVector(NodeExtent));
+
+            if (NodeBounds.IsInsideOrOn(world_space_location))
+            {
+                return true;
+            }
+        }
+    }
+
+    // Check Chunk Actors (World Partition)
+    for (const auto& Chunk : ChunkActors)
+    {
+        if (!Chunk) continue;
+        
+        const FSVOVolumeNavigationData& Volume = Chunk->GetVolumeNavigationData();
+        if (Volume.GetNavigationBounds().IsInside(world_space_location))
         {
             const FVector NodeLocation = Volume.GetNodePositionFromAddress(Address, true);
             const float NodeExtent = Volume.GetNodeExtentFromNodeAddress(Address);
@@ -303,9 +317,21 @@ FBox ASVONavigationData::GetBoundingBox() const
 {
     FBox bounding_box( ForceInit );
 
+    // Add legacy bounds
     for ( const auto & bounds : VolumeNavigationData )
     {
-        bounding_box += bounds.GetData().GetNavigationBounds();
+        // CHANGED: Use GetVolumeBounds (User requested size) instead of GetNavigationBounds (Expanded Octree)
+        bounding_box += bounds.GetVolumeBounds();
+    }
+
+    // Add Chunk Actor bounds
+    for (const auto& Chunk : ChunkActors)
+    {
+        if (Chunk)
+        {
+            // Chunk->GetBounds() is already the user-requested slice
+            bounding_box += Chunk->GetBounds();
+        }
     }
 
     return bounding_box;
@@ -313,8 +339,35 @@ FBox ASVONavigationData::GetBoundingBox() const
 
 const FSVOVolumeNavigationData * ASVONavigationData::GetVolumeNavigationDataContainingPoints( const TArray< FVector > & points ) const
 {
+    // 1. Check Chunk Actors (Prioritize loaded WP chunks)
+    for (const auto& Chunk : ChunkActors)
+    {
+        if (!Chunk) continue;
+
+        const FSVOVolumeNavigationData& Data = Chunk->GetVolumeNavigationData();
+        
+        // Check against tight VolumeBounds to prevent overlapping "phantom" octree space from stealing the query
+        const auto& Bounds = Data.GetVolumeBounds();
+
+        bool bAllPointsInside = true;
+        for (const auto& Point : points)
+        {
+            if (!Bounds.IsInside(Point))
+            {
+                bAllPointsInside = false;
+                break;
+            }
+        }
+
+        if (bAllPointsInside)
+        {
+            return &Data;
+        }
+    }
+
+    // 2. Check Legacy VolumeNavigationData
     return VolumeNavigationData.FindByPredicate( [ this, &points ]( const FSVOVolumeNavigationData & data ) {
-        const auto & bounds = data.GetData().GetNavigationBounds();
+        const auto & bounds = data.GetVolumeBounds(); // Use tight bounds
         for ( const auto & point : points )
         {
             if ( !bounds.IsInside( point ) )

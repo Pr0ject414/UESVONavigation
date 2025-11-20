@@ -1,4 +1,4 @@
-﻿#include "SVOVolumeNavigationData.h"
+#include "SVOVolumeNavigationData.h"
 
 #include "SVOHelpers.h"
 #include "SVONavigationData.h"
@@ -49,6 +49,9 @@ void FSVOVolumeNavigationData::GenerateNavigationData( const FBox & volume_bound
     {
         BuildNeighborLinks( layer_index );
     }
+
+    // Generate portals using the corrected Clustering logic
+    GeneratePortals();
 
     SVOData.bIsValid = true;
 }
@@ -242,4 +245,166 @@ int32 FSVOVolumeNavigationData::GetNodeIndexFromMortonCode( const LayerIndex lay
 
     // Since nodes are ordered, we can use the binary search
     return Algo::BinarySearch( layer_nodes, FSVONode( morton_code ) );
+}
+
+void FSVOVolumeNavigationData::GeneratePortals()
+{
+    Portals.Reset();
+    
+    if (VolumeBounds.GetSize().IsNearlyZero())
+    {
+        return;
+    }
+
+    // The leaf node size and sub-node size determine the resolution of our scan
+    const float SubNodeSize = SVOData.GetLeafNodes().GetLeafSubNodeSize();
+    const float PortalTolerance = SubNodeSize * 0.5f; // Tolerance for boundary checks
+    
+    const FVector Min = VolumeBounds.Min;
+    const FVector Max = VolumeBounds.Max;
+
+    // Using double to match LWC
+    struct FaceParams
+    {
+        uint8 Direction;
+        int32 FixedAxis; // 0=X, 1=Y, 2=Z
+        double FixedValue; 
+        int32 AxisA;
+        int32 AxisB;
+        double StartA, EndA;
+        double StartB, EndB;
+    };
+
+    TArray<FaceParams> Faces;
+    Faces.Emplace(FaceParams{0, 0, Max.X, 1, 2, Min.Y, Max.Y, Min.Z, Max.Z}); // +X
+    Faces.Emplace(FaceParams{1, 0, Min.X, 1, 2, Min.Y, Max.Y, Min.Z, Max.Z}); // -X
+    Faces.Emplace(FaceParams{2, 1, Max.Y, 0, 2, Min.X, Max.X, Min.Z, Max.Z}); // +Y
+    Faces.Emplace(FaceParams{3, 1, Min.Y, 0, 2, Min.X, Max.X, Min.Z, Max.Z}); // -Y
+    Faces.Emplace(FaceParams{4, 2, Max.Z, 0, 1, Min.X, Max.X, Min.Y, Max.Y}); // +Z
+    Faces.Emplace(FaceParams{5, 2, Min.Z, 0, 1, Min.X, Max.X, Min.Y, Max.Y}); // -Z
+
+    for (const FaceParams& Face : Faces)
+    {
+        // Scan resolution: Step every SubNodeSize
+        const int32 StepsA = FMath::CeilToInt((Face.EndA - Face.StartA) / SubNodeSize);
+        const int32 StepsB = FMath::CeilToInt((Face.EndB - Face.StartB) / SubNodeSize);
+        
+        if (StepsA <= 0 || StepsB <= 0) continue;
+
+        // 2D Grid to store navigability status: true = Open, false = Blocked
+        // Using a linear array mapped to [i + j * StepsA]
+        TArray<bool> NavigabilityGrid;
+        NavigabilityGrid.SetNumZeroed(StepsA * StepsB);
+        
+        // Probe slightly inside the volume
+        float ProbeBias = (Face.Direction % 2 == 0) ? -PortalTolerance : PortalTolerance; 
+        
+        // 1. Scan Phase: Populate Grid
+        for (int32 j = 0; j < StepsB; ++j)
+        {
+            for (int32 i = 0; i < StepsA; ++i)
+            {
+                FVector ProbePos;
+                ProbePos[Face.FixedAxis] = Face.FixedValue + ProbeBias;
+                ProbePos[Face.AxisA] = Face.StartA + (i * SubNodeSize) + (SubNodeSize * 0.5f);
+                ProbePos[Face.AxisB] = Face.StartB + (j * SubNodeSize) + (SubNodeSize * 0.5f);
+
+                bool bIsNavigable = false;
+                FSVONodeAddress Address;
+
+                // Check 1: Explicit Node Existence
+                if (GetNodeAddressFromPosition(Address, ProbePos))
+                {
+                    // Node exists: It's navigable ONLY if IsNodeAddressNavigable returns true
+                    if (IsNodeAddressNavigable(Address))
+                    {
+                        bIsNavigable = true;
+                    }
+                }
+                // Check 2: Implicit Empty (Sparsity)
+                // Since chunks now maintain correct global Z bounds (fixed in Generator),
+                // VolumeBounds.IsInside(ProbePos) correctly returns true for High Altitude air.
+                else
+                {
+                    if (VolumeBounds.IsInside(ProbePos))
+                    {
+                        bIsNavigable = true;
+                    }
+                }
+
+                NavigabilityGrid[i + j * StepsA] = bIsNavigable;
+            }
+        }
+
+        // 2. Clustering Phase: Connected Component Labeling (Flood Fill)
+        // We identify isolated islands of open voxels to create separate portals
+        TArray<bool> Visited;
+        Visited.SetNumZeroed(StepsA * StepsB);
+
+        for (int32 j = 0; j < StepsB; ++j)
+        {
+            for (int32 i = 0; i < StepsA; ++i)
+            {
+                int32 Index = i + j * StepsA;
+                if (NavigabilityGrid[Index] && !Visited[Index])
+                {
+                    // Found a new unvisited open island. Start Flood Fill.
+                    int32 MinI = i, MaxI = i;
+                    int32 MinJ = j, MaxJ = j;
+
+                    TArray<FIntPoint> Queue;
+                    Queue.Push(FIntPoint(i, j));
+                    Visited[Index] = true;
+
+                    while (Queue.Num() > 0)
+                    {
+                        FIntPoint P = Queue.Pop();
+                        
+                        MinI = FMath::Min(MinI, P.X);
+                        MaxI = FMath::Max(MaxI, P.X);
+                        MinJ = FMath::Min(MinJ, P.Y);
+                        MaxJ = FMath::Max(MaxJ, P.Y);
+
+                        // Check 4 neighbors (Von Neumann neighborhood)
+                        const FIntPoint Neighbors[] = { {P.X+1, P.Y}, {P.X-1, P.Y}, {P.X, P.Y+1}, {P.X, P.Y-1} };
+                        for (const FIntPoint& N : Neighbors)
+                        {
+                            if (N.X >= 0 && N.X < StepsA && N.Y >= 0 && N.Y < StepsB)
+                            {
+                                int32 NIndex = N.X + N.Y * StepsA;
+                                if (NavigabilityGrid[NIndex] && !Visited[NIndex])
+                                {
+                                    Visited[NIndex] = true;
+                                    Queue.Push(N);
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. Portal Construction
+                    // Convert grid bounds (MinI/MaxI etc.) back to World Space
+                    FVector PortalMin, PortalMax;
+                    
+                    // Fixed Axis is constant (with small thickness for overlap check)
+                    PortalMin[Face.FixedAxis] = Face.FixedValue - 25.0f; 
+                    PortalMax[Face.FixedAxis] = Face.FixedValue + 25.0f;
+
+                    // Axis A
+                    PortalMin[Face.AxisA] = Face.StartA + (MinI * SubNodeSize);
+                    PortalMax[Face.AxisA] = Face.StartA + ((MaxI + 1) * SubNodeSize);
+
+                    // Axis B
+                    PortalMin[Face.AxisB] = Face.StartB + (MinJ * SubNodeSize);
+                    PortalMax[Face.AxisB] = Face.StartB + ((MaxJ + 1) * SubNodeSize);
+
+                    FBox PortalBox(PortalMin, PortalMax);
+                    
+                    Portals.Emplace(PortalBox.GetCenter(), PortalBox.GetExtent(), Face.Direction);
+
+                    UE_LOG(LogNavigation, Verbose, TEXT("Generated Clustered Portal on Face %d. Center: %s, Size: %s"), 
+                        Face.Direction, *PortalBox.GetCenter().ToString(), *PortalBox.GetExtent().ToString());
+                }
+            }
+        }
+    }
 }

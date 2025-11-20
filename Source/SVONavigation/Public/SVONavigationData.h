@@ -12,6 +12,7 @@
 class USVONavigationDataChunk;
 class USVONavDataRenderingComponent;
 struct FSVONavigationBounds;
+class ASVONavigationDataChunkActor;
 
 UCLASS( config = Engine, defaultconfig, hidecategories = ( Input, Physics, Collisions, Lighting, Rendering, Tags, "Utilities|Transformation", Actor, Layers, Replication ), notplaceable )
 class SVONAVIGATION_API ASVONavigationData final : public ANavigationData
@@ -24,8 +25,34 @@ public:
     friend class FSVONavigationDataGenerator;
 
     const FSVOVolumeNavigationDataDebugInfos & GetDebugInfos() const;
+    
+    // -- Legacy Monolithic Accessor --
     const TArray< FSVOVolumeNavigationData > & GetVolumeNavigationData() const;
 
+    // -- World Partition Chunk Management --
+    void RegisterChunkActor(ASVONavigationDataChunkActor* ChunkActor);
+    void UnregisterChunkActor(ASVONavigationDataChunkActor* ChunkActor);
+    
+    /** 
+     * Requests a background build for a specific chunk actor.
+     * Used during PIE/Editor when a chunk is loaded but has no data,
+     * or when dynamic updates trigger a dirty event.
+     */
+    void RequestBuildForChunk(ASVONavigationDataChunkActor* ChunkActor);
+    
+    /**
+     * Processes a list of dirty bounds (from legacy calls) by routing them 
+     * to the World Subsystem to find affected chunks.
+     */
+    void RebuildDirtyBounds(const TArray<FBox>& DirtyBounds);
+
+    const TArray<TObjectPtr<ASVONavigationDataChunkActor>>& GetChunkActors() const { return ChunkActors; }
+
+    // -- Dynamic Occluder Registration --
+    void RegisterDynamicOccluder(const AActor* Occluder);
+    void UnregisterDynamicOccluder(const AActor* Occluder);
+
+    // -- ANavigationData Interface --
     void PostInitProperties() override;
     void PostLoad() override;
     void Serialize( FArchive & archive ) override;
@@ -69,7 +96,9 @@ public:
     void ConditionalConstructGenerator() override;
 
     void RequestDrawingUpdate( bool force = false );
+    
     FBox GetBoundingBox() const;
+    
     void RemoveDataInBounds( const FBox & bounds );
 
     template < typename _ALLOCATOR_TYPE_ >
@@ -82,7 +111,9 @@ public:
     }
 
     void AddVolumeNavigationData( FSVOVolumeNavigationData data );
+    
     const FSVOVolumeNavigationData * GetVolumeNavigationDataContainingPoints( const TArray< FVector > & points ) const;
+    
     void UpdateNavVersion();
 
 private:
@@ -108,7 +139,7 @@ private:
     UPROPERTY( EditInstanceOnly, Category = "Display" )
     FSVOVolumeNavigationDataDebugInfos DebugInfos;
 
-    UPROPERTY( VisibleInstanceONly, Category = "Display" )
+    UPROPERTY( VisibleInstanceOnly, Category = "Display" )
     FSVODataInfos DataInfos;
 
     UPROPERTY( EditAnywhere, config, Category = "Generation" )
@@ -118,6 +149,10 @@ private:
     int32 MaxSimultaneousBoxGenerationJobsCount;
 
     TArray< FSVOVolumeNavigationData > VolumeNavigationData;
+
+    UPROPERTY(Transient, VisibleInstanceOnly, Category = "SVO Runtime")
+    TArray<TObjectPtr<ASVONavigationDataChunkActor>> ChunkActors;
+
     ESVOVersion Version;
 };
 

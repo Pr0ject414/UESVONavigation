@@ -4,9 +4,10 @@
 #include "PathFinding/SVONavigationPathFinderImpl.h"
 #include "SVONavigationDataChunk.h"
 #include "SVOVersion.h"
-
-#include "AI/NavDataGenerator.h"
+#include "Core/SVONavigationDataChunkActor.h"
+#include "SVONavigationDataGenerator.h"
 #include "NavigationSystem.h"
+#include "Grid/SVONavigationWorldSubsystem.h"
 
 ASVONavigationData::ASVONavigationData() :
     Version( ESVOVersion::Latest )
@@ -16,6 +17,68 @@ ASVONavigationData::ASVONavigationData() :
     if ( !HasAnyFlags( RF_ClassDefaultObject ) )
     {
         FindPathImplementation = FSVONavigationPathFinderImpl::FindPath;
+    }
+}
+
+void ASVONavigationData::RegisterChunkActor(ASVONavigationDataChunkActor* ChunkActor)
+{
+    if (!ChunkActor)
+    {
+        return;
+    }
+
+    if (!ChunkActors.Contains(ChunkActor))
+    {
+        ChunkActors.Add(ChunkActor);
+#if !UE_BUILD_SHIPPING
+        RequestDrawingUpdate();
+#endif
+    }
+}
+
+void ASVONavigationData::UnregisterChunkActor(ASVONavigationDataChunkActor* ChunkActor)
+{
+    if (!ChunkActor)
+    {
+        return;
+    }
+
+    const int32 RemovedCount = ChunkActors.Remove(ChunkActor);
+    if (RemovedCount > 0)
+    {
+        if (ActivePaths.Num() > 0)
+        {
+            InvalidateAffectedPaths({ ChunkActor->GetBounds() });
+        }
+
+#if !UE_BUILD_SHIPPING
+        RequestDrawingUpdate();
+#endif
+    }
+}
+
+void ASVONavigationData::RequestBuildForChunk(ASVONavigationDataChunkActor* ChunkActor)
+{
+    if (!ChunkActor)
+    {
+        return;
+    }
+
+    // 1. Ensure Generator exists
+    ConditionalConstructGenerator();
+
+    if (NavDataGenerator.IsValid())
+    {
+        if (FSVONavigationDataGenerator* SVOGenerator = static_cast<FSVONavigationDataGenerator*>(NavDataGenerator.Get()))
+        {
+            // 2. Queue specific bounds for rebuild.
+            // The generator's internal logic (RebuildBounds) handles deduplication of pending requests.
+            // Note: If a build is currently RUNNING for this chunk, the generator will queue a NEW pending build
+            // to ensure the latest changes are captured. This is the desired behavior for dynamic updates.
+            
+            UE_LOG(LogNavigation, Log, TEXT("Requesting on-demand build for chunk: %s"), *ChunkActor->GetName());
+            SVOGenerator->RebuildBounds({ ChunkActor->GetBounds() });
+        }
     }
 }
 
@@ -95,7 +158,7 @@ void ASVONavigationData::Serialize( FArchive & archive )
         {
             // empty, just skip over this data
             archive.Seek( svo_size_position + svo_size_bytes );
-            // if it's not getting filled it's better to just remove it
+            // if it's not getting filled, it's better to just remove it
             VolumeNavigationData.Reset();
         }
     }
@@ -148,7 +211,7 @@ void ASVONavigationData::SerializeSVOData( FArchive & archive, ESVOVersion versi
             for ( const auto & navigable_bounds : level_navigable_bounds )
             {
                 const auto index = VolumeNavigationData.IndexOfByPredicate( [ &navigable_bounds ]( const auto & navigation_data ) {
-                    return !navigation_data.IsInNavigationDataChunk() && /*!*/( navigation_data.GetVolumeBounds() == navigable_bounds );
+                    return !navigation_data.IsInNavigationDataChunk() && ( navigation_data.GetVolumeBounds() == navigable_bounds );
                 } );
 
                 if ( index != INDEX_NONE )
@@ -183,4 +246,37 @@ void ASVONavigationData::SerializeSVOData( FArchive & archive, ESVOVersion versi
 void ASVONavigationData::RecreateDefaultFilter() const
 {
     DefaultQueryFilter->SetFilterType< FSVONavigationQueryFilterImpl >();
+}
+
+void ASVONavigationData::RebuildDirtyBounds(const TArray<FBox>& DirtyBounds)
+{
+    if (UWorld* World = GetWorld())
+    {
+        if (USVONavigationWorldSubsystem* Subsystem = World->GetSubsystem<USVONavigationWorldSubsystem>())
+        {
+            for (const FBox& Box : DirtyBounds)
+            {
+                Subsystem->NotifyNavigationDirty(Box);
+            }
+        }
+    }
+}
+
+void ASVONavigationData::RegisterDynamicOccluder(const AActor* Occluder)
+{
+    if (!Occluder) return;
+
+    // Find overlapping volumes/chunks and register the occluder.
+    // Note: SVO typically bakes static geometry. Dynamic occluders in SVO usually require
+    // storing a reference in the leaf nodes or a separate structure. 
+    // For this Phase, we treat dynamic occluders as triggers for rebuilds via dirty bounds.
+    // Future phases can implement soft occlusion (doors) without rebuilds.
+    
+    RebuildDirtyBounds({ Occluder->GetComponentsBoundingBox(true) });
+}
+
+void ASVONavigationData::UnregisterDynamicOccluder(const AActor* Occluder)
+{
+    if (!Occluder) return;
+    RebuildDirtyBounds({ Occluder->GetComponentsBoundingBox(true) });
 }

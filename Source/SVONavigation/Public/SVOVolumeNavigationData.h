@@ -2,6 +2,7 @@
 
 #include <Templates/SubclassOf.h>
 
+#include "Common/SVODataTypes.h"
 #include "Common/SVONavigationTypes.h"
 
 class UNavigationQueryFilter;
@@ -52,6 +53,19 @@ public:
     bool IsNodeAddressNavigable(const FSVONodeAddress& Address) const;
     void FindNodesInSphere(const FVector& Center, float Radius, TArray<FSVONodeAddress>& OutNodes) const;
 
+    /**
+     * Finds the closest navigable position to the target within a search radius.
+     * Uses BFS starting from the node at TargetPos (even if occluded) to find a free neighbor.
+     * @param TargetPos The desired world position.
+     * @param OutNavigablePos The resulting safe position.
+     * @param SearchRadius Maximum distance to search.
+     * @return True if a navigable position was found.
+     */
+    bool GetClosestNavigablePosition(const FVector& TargetPos, FVector& OutNavigablePos, float SearchRadius) const;
+    
+    /** Returns the generated portals for this volume. Used for Macro Pathfinding. */
+    const TArray<FSVOPortal>& GetPortals() const { return Portals; }
+
     void GenerateNavigationData( const FBox & volume_bounds, const FSVOVolumeNavigationDataGenerationSettings & generation_settings );
     void Serialize( FArchive & archive, const ESVOVersion version );
     void Reset();
@@ -70,12 +84,24 @@ private:
     void GetFreeNodesFromNodeAddress( FSVONodeAddress node_address, TArray< FSVONodeAddress > & free_nodes ) const;
     void BuildParentLinkForLeafNodes( const TMap< LeafIndex, MortonCode > & leaf_index_to_parent_morton_code_map );
     void FindNodesInSphereRecursive(const FVector& Center, float RadiusSq, const FSVONodeAddress& CurrentNodeAddress, TArray<FSVONodeAddress>& OutNodes) const;
+    
+    /** Scans the boundaries of the volume to identify open voxels. */
+    void IdentifyBoundaryVoxels();
+
+    /** Converts identified boundary voxels into FSVOPortal structures. */
+    void GeneratePortals();
 
     FSVOVolumeNavigationDataGenerationSettings Settings;
     FBox VolumeBounds;
     FSVOData SVOData;
     TSubclassOf< USVONavigationQueryFilter > VolumeNavigationQueryFilter;
     bool bInNavigationDataChunk;
+
+    /** Intermediate storage for voxels found on the boundary */
+    TArray<FSVOEdgeVoxel> BoundaryVoxels;
+
+    /** Generated connection portals */
+    TArray<FSVOPortal> Portals;
 };
 
 FORCEINLINE bool FSVOVolumeNavigationData::IsInNavigationDataChunk() const

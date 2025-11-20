@@ -2,12 +2,13 @@
 
 #include "SVOHelpers.h"
 #include "SVONavigationData.h"
+#include "Core/SVONavigationDataChunkActor.h"
 
-#include <Debug/DebugDrawService.h>
-#include <Engine/CollisionProfile.h>
+#include "Debug/DebugDrawService.h"
+#include "Engine/CollisionProfile.h"
 
 #if !UE_BUILD_SHIPPING && !UE_BUILD_TEST
-#include <Engine/Canvas.h>
+#include "Engine/Canvas.h"
 #endif
 
 #if WITH_EDITOR
@@ -17,6 +18,7 @@
 
 static const FColor OccludedVoxelColor = FColor::Orange;
 static const FColor FreeVoxelColor = FColor::Green;
+static const FColor PortalColor = FColor::Cyan;
 
 FSVONavigationMeshSceneProxy::FSVONavigationMeshSceneProxy( const UPrimitiveComponent * component ) :
     FDebugRenderSceneProxy( component )
@@ -32,21 +34,32 @@ FSVONavigationMeshSceneProxy::FSVONavigationMeshSceneProxy( const UPrimitiveComp
     }
 
     const auto & debug_infos = NavigationData->GetDebugInfos();
-    const auto & all_navigation_bounds_data = NavigationData->GetVolumeNavigationData();
 
-    for ( const auto & navigation_bounds_data : all_navigation_bounds_data )
+    // Helper lambda to draw a single volume (reused for Legacy and Chunk data)
+    auto ProcessVolumeData = [&](const FSVOVolumeNavigationData& Data)
     {
-        const auto & octree_data = navigation_bounds_data.GetData();
+        const auto & octree_data = Data.GetData();
         const auto layer_count = octree_data.GetLayerCount();
 
         if ( layer_count == 0 )
         {
-            continue;
+            return;
         }
 
         if ( debug_infos.bDebugDrawBounds )
         {
-            Boxes.Emplace( navigation_bounds_data.GetData().GetNavigationBounds(), FColor::White );
+            Boxes.Emplace( Data.GetData().GetNavigationBounds(), FColor::White );
+        }
+
+        // -- Draw Portals --
+        if (debug_infos.bDebugDrawPortals)
+        {
+            const TArray<FSVOPortal>& Portals = Data.GetPortals();
+            for (const FSVOPortal& Portal : Portals)
+            {
+                // Draw portal as a wireframe box
+                Boxes.Emplace(FBox::BuildAABB(Portal.Location, Portal.Extent), PortalColor);
+            }
         }
 
         const auto & leaf_nodes = octree_data.GetLeafNodes();
@@ -68,14 +81,14 @@ FSVONavigationMeshSceneProxy::FSVONavigationMeshSceneProxy( const UPrimitiveComp
 
         if ( debug_infos.bDebugDrawNeighborLinks && node_address_for_neighbors.IsValid() )
         {
-            DrawNeighborInfos( navigation_bounds_data, node_address_for_neighbors );
+            DrawNeighborInfos( Data, node_address_for_neighbors );
             return;
         }
 
         if ( debug_infos.bDebugDrawLayers )
         {
             const auto corrected_layer_index = FMath::Clamp( static_cast< int >( debug_infos.LayerIndexToDraw ), 0, layer_count - 1 );
-            const auto node_extent = navigation_bounds_data.GetData().GetLayer( corrected_layer_index ).GetNodeExtent();
+            const auto node_extent = Data.GetData().GetLayer( corrected_layer_index ).GetNodeExtent();
 
             for ( const auto & node : octree_data.GetLayer( corrected_layer_index ).GetNodes() )
             {
@@ -83,7 +96,7 @@ FSVONavigationMeshSceneProxy::FSVONavigationMeshSceneProxy( const UPrimitiveComp
 
                 if ( corrected_layer_index == 0 )
                 {
-                    const auto leaf_node_position = navigation_bounds_data.GetLeafNodePositionFromMortonCode( code );
+                    const auto leaf_node_position = Data.GetLeafNodePositionFromMortonCode( code );
 
                     if ( AddVoxelToBoxes( leaf_node_position, leaf_node_extent, node.HasChildren() ) )
                     {
@@ -92,7 +105,7 @@ FSVONavigationMeshSceneProxy::FSVONavigationMeshSceneProxy( const UPrimitiveComp
                 }
                 else
                 {
-                    const auto position = navigation_bounds_data.GetNodePositionFromLayerAndMortonCode( corrected_layer_index, code );
+                    const auto position = Data.GetNodePositionFromLayerAndMortonCode( corrected_layer_index, code );
 
                     if ( AddVoxelToBoxes( position, node_extent, node.HasChildren() ) )
                     {
@@ -114,7 +127,7 @@ FSVONavigationMeshSceneProxy::FSVONavigationMeshSceneProxy( const UPrimitiveComp
                 {
                     const auto & leaf = octree_data.GetLeafNodes().GetLeafNode( leaf_node.FirstChild.NodeIndex );
                     const auto code = leaf_node.MortonCode;
-                    const auto leaf_node_position = navigation_bounds_data.GetLeafNodePositionFromMortonCode( code );
+                    const auto leaf_node_position = Data.GetLeafNodePositionFromMortonCode( code );
 
                     for ( SubNodeIndex sub_node_index = 0; sub_node_index < 64; sub_node_index++ )
                     {
@@ -129,6 +142,23 @@ FSVONavigationMeshSceneProxy::FSVONavigationMeshSceneProxy( const UPrimitiveComp
                     }
                 }
             }
+        }
+    };
+
+    // 1. Process Legacy Monolithic Data
+    const auto & all_navigation_bounds_data = NavigationData->GetVolumeNavigationData();
+    for ( const auto & navigation_bounds_data : all_navigation_bounds_data )
+    {
+        ProcessVolumeData(navigation_bounds_data);
+    }
+
+    // 2. Process World Partition Chunk Actors
+    const TArray<TObjectPtr<ASVONavigationDataChunkActor>>& ChunkActors = NavigationData->GetChunkActors();
+    for (const auto& ChunkActor : ChunkActors)
+    {
+        if (ChunkActor)
+        {
+            ProcessVolumeData(ChunkActor->GetVolumeNavigationData());
         }
     }
 }
@@ -273,7 +303,6 @@ void FSVODebugDrawDelegateHelper::InitDelegateHelper( const FSVONavigationMeshSc
 
 void FSVODebugDrawDelegateHelper::RegisterDebugDrawDelegateInternal()
 {
-    ensureMsgf( State != RegisteredState, TEXT( "RegisterDebugDrawDelgate is already Registered!" ) );
     if ( State == InitializedState )
     {
         DebugTextDrawingDelegate = FDebugDrawDelegate::CreateRaw( this, &FSVODebugDrawDelegateHelper::DrawDebugLabels );
@@ -284,7 +313,6 @@ void FSVODebugDrawDelegateHelper::RegisterDebugDrawDelegateInternal()
 
 void FSVODebugDrawDelegateHelper::UnregisterDebugDrawDelegate()
 {
-    ensureMsgf( State != InitializedState, TEXT( "UnegisterDebugDrawDelgate is in an invalid State: %i !" ), State );
     if ( State == RegisteredState )
     {
         check( DebugTextDrawingDelegate.IsBound() );
@@ -312,10 +340,8 @@ FPrimitiveSceneProxy * USVONavDataRenderingComponent::CreateSceneProxy()
     {
         if ( const ASVONavigationData * navigation_data = Cast< ASVONavigationData >( GetOwner() ) )
         {
-            if ( navigation_data->IsDrawingEnabled() )
-            {
-                proxy = new FSVONavigationMeshSceneProxy( this );
-            }
+            // Removed IsDrawingEnabled() check to ensure it draws if the component is visible and show flags are on
+            proxy = new FSVONavigationMeshSceneProxy( this );
         }
     }
 
@@ -373,7 +399,7 @@ bool USVONavDataRenderingComponent::IsNavigationShowFlagSet( const UWorld * worl
         show_navigation = world_context->GameViewport != nullptr && world_context->GameViewport->EngineShowFlags.Navigation;
         if ( show_navigation == false )
         {
-            // we have to check all viewports because we can't to distinguish between SIE and PIE at this point.
+            // we have to check all viewports because we can't distinguish between SIE and PIE at this point.
             for ( FEditorViewportClient * current_viewport : GEditor->GetAllViewportClients() )
             {
                 if ( current_viewport && current_viewport->EngineShowFlags.Navigation )

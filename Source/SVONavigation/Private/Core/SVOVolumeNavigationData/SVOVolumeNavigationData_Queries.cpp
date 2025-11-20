@@ -1,7 +1,6 @@
 ﻿#include "SVOVolumeNavigationData.h"
 
 #include "SVOHelpers.h"
-#include <ThirdParty/libmorton/morton.h>
 
 FVector FSVOVolumeNavigationData::GetNodePositionFromAddress( const FSVONodeAddress & address, const bool try_get_sub_node_position ) const
 {
@@ -96,7 +95,7 @@ bool FSVOVolumeNavigationData::GetNodeAddressFromPosition( FSVONodeAddress & nod
     navigation_bounds.GetCenterAndExtents( origin, extent );
     // The z-order origin of the volume (where code == 0)
     const auto z_origin = origin - extent;
-    // The local position of the point in volume space
+    // The local position of the point in the volume space
     const auto local_position = position - z_origin;
 
     const auto layer_count = GetLayerCount();
@@ -173,7 +172,7 @@ bool FSVOVolumeNavigationData::GetNodeAddressFromPosition( FSVONodeAddress & nod
                 return true;
             }
 
-            // If we've got here, the current node has a child, and isn't a leaf, so lets go down...
+            // If we've got here, the current node has a child and isn't a leaf, so let's go down...
             layer_index = layer_nodes[ node_index ].FirstChild.LayerIndex;
             nodeIndex = layer_nodes[ node_index ].FirstChild.NodeIndex;
 
@@ -240,22 +239,24 @@ bool FSVOVolumeNavigationData::IsNodeAddressNavigable(const FSVONodeAddress& Add
         return false;
     }
 
+    // Safe retrieval, though typically we assume Address is valid indices
     const FSVONode& Node = GetNodeFromAddress(Address);
 
     if (Address.LayerIndex > 0)
     {
-        // A non-leaf node is navigable if it represents a large open space (has no children).
+        // In SVO, if a higher layer node has no children, it means it's homogeneous (Empty or Full).
+        // Usually generation logic ensures only Empty nodes remain as "leaves" at higher levels, 
+        // but let's stick to the definition that "HasChildren == false" implies navigability for this structure.
         return !Node.HasChildren();
     }
     
-    // This is a leaf-level node (Layer 0)
     if (!Node.HasChildren())
     {
-        // This is a completely open leaf node.
+        // "Layer 0" node with no children is fully navigable
         return true;
     }
 
-    // This leaf node has sub-nodes. We must check the specific sub-node.
+    // "Layer 0" node with children -> check specific subnode bit
     const FSVOLeafNode& Leaf = SVOData.GetLeafNodes().GetLeafNode(Node.FirstChild.NodeIndex);
     return !Leaf.IsSubNodeOccluded(Address.SubNodeIndex);
 }
@@ -269,6 +270,62 @@ void FSVOVolumeNavigationData::FindNodesInSphere(const FVector& Center, float Ra
     
     const FSVONodeAddress RootNodeAddress(SVOData.GetLayerCount() - 1, 0, 0);
     FindNodesInSphereRecursive(Center, FMath::Square(Radius), RootNodeAddress, OutNodes);
+}
+
+bool FSVOVolumeNavigationData::GetClosestNavigablePosition(const FVector& TargetPos, FVector& OutNavigablePos, float SearchRadius) const
+{
+    // 1. Try the exact position first
+    FSVONodeAddress ExactAddress;
+    if (GetNodeAddressFromPosition(ExactAddress, TargetPos))
+    {
+        if (IsNodeAddressNavigable(ExactAddress))
+        {
+            OutNavigablePos = TargetPos;
+            return true;
+        }
+    }
+
+    // 2. If the exact position is blocked (or out of bounds), we need to find the closest *navigable* node.
+    // Standard "FindNodesInSphere" will return EVERYTHING. We need to sort by distance.
+    
+    TArray<FSVONodeAddress> CandidateNodes;
+    FindNodesInSphere(TargetPos, SearchRadius, CandidateNodes);
+    
+    if (CandidateNodes.Num() == 0)
+    {
+        return false;
+    }
+
+    float ClosestDistSq = MAX_flt;
+    bool bFound = false;
+    FVector BestPos = FVector::ZeroVector;
+
+    // To handle "Sliding Portal" logic, we prioritize nodes closer to the TargetPos.
+    for (const FSVONodeAddress& Addr : CandidateNodes)
+    {
+        if (IsNodeAddressNavigable(Addr))
+        {
+            FVector NodeCenter = GetNodePositionFromAddress(Addr, true);
+            float DistSq = FVector::DistSquared(TargetPos, NodeCenter);
+
+            // Optimization: If the node bounds actually contain the target point projected onto the valid area, 
+            // we might want that. But using Center is robust enough for portals.
+            
+            if (DistSq < ClosestDistSq)
+            {
+                ClosestDistSq = DistSq;
+                BestPos = NodeCenter;
+                bFound = true;
+            }
+        }
+    }
+    
+    if (bFound)
+    {
+        OutNavigablePos = BestPos;
+    }
+
+    return bFound;
 }
 
 void FSVOVolumeNavigationData::GetFreeNodesFromNodeAddress( const FSVONodeAddress node_address, TArray< FSVONodeAddress > & free_nodes ) const
@@ -328,6 +385,7 @@ void FSVOVolumeNavigationData::FindNodesInSphereRecursive(const FVector& Center,
     const float NodeExtent = SVOData.GetLayer(CurrentNodeAddress.LayerIndex).GetNodeExtent();
     const FBox NodeBounds = FBox::BuildAABB(NodeCenter, FVector(NodeExtent));
 
+    // AABB / Sphere intersection test
     if (!FMath::SphereAABBIntersection(FSphere(Center, FMath::Sqrt(RadiusSq)), NodeBounds))
     {
         return;
@@ -335,12 +393,15 @@ void FSVOVolumeNavigationData::FindNodesInSphereRecursive(const FVector& Center,
 
     const FSVONode& Node = GetNodeFromAddress(CurrentNodeAddress);
 
+    // If this node is a leaf (no children), add it (Navigability usually checked by caller, but we can filter here if desired)
+    // Here we just return the node structure; caller filters for navigability.
     if (!Node.HasChildren())
     {
         OutNodes.AddUnique(CurrentNodeAddress);
         return;
     }
 
+    // Recurse
     if (CurrentNodeAddress.LayerIndex > 0)
     {
         const FSVONodeAddress& FirstChildAddress = Node.FirstChild;

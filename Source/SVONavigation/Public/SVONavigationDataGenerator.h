@@ -5,6 +5,7 @@
 #include <AI/NavDataGenerator.h>
 
 class ASVONavigationData;
+class ASVONavigationDataChunkActor;
 
 class FSVONavigationDataGenerator;
 
@@ -24,11 +25,6 @@ private:
     TWeakObjectPtr< UWorld > World;
     FNavDataConfig NavDataConfig;
 };
-
-FORCEINLINE FSVOVolumeNavigationData FSVOVolumeNavigationDataGenerator::GetBoundsNavigationData() const
-{
-    return BoundsNavigationData;
-}
 
 struct SVONAVIGATION_API FSVOBoxGeneratorWrapper : public FNonAbandonableTask
 {
@@ -132,7 +128,7 @@ public:
     int32 GetNumRemaningBuildTasks() const override;
     int32 GetNumRunningBuildTasks() const override;
 
-    /** Rebuilds navigation data for the specified bounds, bypassing the internal RegisteredNavigationBounds filter. */
+    /** Rebuilds navigation data for the specified bounds bypassing the internal RegisteredNavigationBounds filter. */
     void RebuildBounds(const TArray<FBox>& BoundsToRebuild);
 
 private:
@@ -141,6 +137,10 @@ private:
     void UpdateNavigationBounds();
     TArray< FBox > ProcessAsyncTasks( int32 task_to_process_count );
     TSharedRef< FSVOVolumeNavigationDataGenerator > CreateBoxNavigationGenerator( const FBox & box );
+
+    // -- Automatic Partitioning Logic --
+    TArray<FBox> PartitionVolume(const FBox& OriginalVolume) const;
+    ASVONavigationDataChunkActor* SpawnOrUpdateChunkActor(const FBox& ChunkBounds, const FSVOVolumeNavigationData& NavData);
 
     ASVONavigationData & NavigationData;
     FSVODataGenerationSettings GenerationSettings;
@@ -168,4 +168,9 @@ FORCEINLINE UWorld * FSVONavigationDataGenerator::GetWorld() const
 FORCEINLINE const FSVODataGenerationSettings & FSVONavigationDataGenerator::GetGenerationSettings() const
 {
     return GenerationSettings;
+}
+
+FORCEINLINE FSVOVolumeNavigationData FSVOVolumeNavigationDataGenerator::GetBoundsNavigationData() const
+{
+    return BoundsNavigationData;
 }

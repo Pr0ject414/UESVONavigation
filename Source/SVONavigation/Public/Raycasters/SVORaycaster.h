@@ -1,9 +1,11 @@
 #pragma once
 
-#include <CoreMinimal.h>
+#include "CoreMinimal.h"
 
 #include "Common/SVONodeTypes.h"
 #include "SVORayCaster.generated.h"
+
+class ASVONavigationData;
 
 struct FSVORaycasterTraversedNode
 {
@@ -60,7 +62,16 @@ class SVONAVIGATION_API USVORayCaster : public UObject
     GENERATED_BODY()
 
 public:
+    /**
+     * Traces a ray within a SINGLE volume.
+     */
     bool Trace( const FSVOVolumeNavigationData & volume_navigation_data, const FVector & from, const FVector & to ) const;
+
+    /**
+     * Traces a ray across MULTIPLE loaded chunks (World Partition compatible).
+     * Used for checking Line of Sight in Theta* across chunk boundaries.
+     */
+    bool TraceStack(const ASVONavigationData& NavigationData, const FVector& From, const FVector& To) const;
 
     void SetObserver( TSharedPtr< FSVORayCasterObserver > observer );
 

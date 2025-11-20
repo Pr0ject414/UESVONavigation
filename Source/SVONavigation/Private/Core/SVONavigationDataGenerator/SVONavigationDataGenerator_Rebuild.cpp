@@ -30,7 +30,7 @@ void FSVONavigationDataGenerator::OnNavigationBoundsChanged()
 
 void FSVONavigationDataGenerator::RebuildDirtyAreas( const TArray< FNavigationDirtyArea > & dirty_areas )
 {
-    // The dirty areas are not always in the navigation bounds. If we move a static mesh outside of the navigation bounds, that function is called nonetheless
+    // The dirty areas are not always in the navigation bounds. If we move a static mesh outside the navigation bounds, that function is called nonetheless,
     // So let's first keep only the areas which are in the known navigation bounds
     for ( const auto & dirty_area : dirty_areas )
     {
@@ -40,17 +40,8 @@ void FSVONavigationDataGenerator::RebuildDirtyAreas( const TArray< FNavigationDi
 
         for ( const auto & matching_bounds_element : matching_bounds )
         {
-            // Don't add another pending generation if one is already there for the navigation bounds the dirty area is in
-            if ( PendingBoundsDataGenerationElements.FindByPredicate( [ &matching_bounds_element ]( const FPendingBoundsDataGenerationElement & pending_element ) {
-                     return pending_element.VolumeBounds == matching_bounds_element;
-                 } ) == nullptr )
-            {
-                FPendingBoundsDataGenerationElement pending_box_element;
-                pending_box_element.VolumeBounds = matching_bounds_element;
-                PendingBoundsDataGenerationElements.Emplace( pending_box_element );
-
-                NavigationData.RemoveDataInBounds( matching_bounds_element );
-            }
+            // Re-route to the robust RebuildBounds function which handles Partitioning
+            RebuildBounds({ matching_bounds_element });
         }
     }
 
@@ -140,7 +131,7 @@ void FSVONavigationDataGenerator::UpdateNavigationBounds()
                 }
 
                 // :NOTE: Commented because starting in UE5 or UE5.1 it will always remove all nav data
-                // Can be removed later when it's sure this can be dropped
+                // Can be removed later when it's certain this can be dropped
                 // Remove the existing navigation bounds which don't match the new navigation bounds
                 // NavigationData.RemoveDataInBounds( RegisteredNavigationBounds );
             }
@@ -165,19 +156,42 @@ void FSVONavigationDataGenerator::UpdateNavigationBounds()
 void FSVONavigationDataGenerator::RebuildBounds(const TArray<FBox>& BoundsToRebuild)
 {
     NavigationData.UpdateNavVersion();
+
+    const bool bIsPartitioned = GetWorld() && GetWorld()->IsPartitionedWorld();
     
     for (const FBox& BuildBounds : BoundsToRebuild)
     {
-        // Don't add another pending generation if one is already there for these bounds.
-        if (PendingBoundsDataGenerationElements.FindByPredicate([&BuildBounds](const FPendingBoundsDataGenerationElement& PendingElement) {
-            return PendingElement.VolumeBounds == BuildBounds;
-        }) == nullptr)
+        // == World Partition Logic ==
+        // If we are in WP, we MUST split the request into grid-aligned chunks.
+        // Otherwise, we get one giant non-aligned volume that won't stitch correctly with neighbors.
+        if (bIsPartitioned)
         {
-            FPendingBoundsDataGenerationElement PendingBoxElement;
-            PendingBoxElement.VolumeBounds = BuildBounds;
-            PendingBoundsDataGenerationElements.Emplace(PendingBoxElement);
+            TArray<FBox> Partitions = PartitionVolume(BuildBounds);
+            for (const FBox& PartBox : Partitions)
+            {
+                if (PendingBoundsDataGenerationElements.FindByPredicate([&PartBox](const FPendingBoundsDataGenerationElement& PendingElement) {
+                    return PendingElement.VolumeBounds == PartBox;
+                }) == nullptr)
+                {
+                    FPendingBoundsDataGenerationElement PendingBoxElement;
+                    PendingBoxElement.VolumeBounds = PartBox;
+                    PendingBoundsDataGenerationElements.Emplace(PendingBoxElement);
+                }
+            }
+        }
+        // == Legacy Logic ==
+        else
+        {
+            if (PendingBoundsDataGenerationElements.FindByPredicate([&BuildBounds](const FPendingBoundsDataGenerationElement& PendingElement) {
+                return PendingElement.VolumeBounds == BuildBounds;
+            }) == nullptr)
+            {
+                FPendingBoundsDataGenerationElement PendingBoxElement;
+                PendingBoxElement.VolumeBounds = BuildBounds;
+                PendingBoundsDataGenerationElements.Emplace(PendingBoxElement);
 
-            NavigationData.RemoveDataInBounds(BuildBounds);
+                NavigationData.RemoveDataInBounds(BuildBounds);
+            }
         }
     }
     

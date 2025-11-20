@@ -12,6 +12,7 @@ FSVOVolumeNavigationDataDebugInfos::FSVOVolumeNavigationDataDebugInfos() :
     bDebugDrawOccludedVoxels( true ),
     bDebugDrawFreeVoxels( false ),
     bDebugDrawNeighborLinks( false ),
+    bDebugDrawPortals( false ),
     bDebugDrawActivePaths( false )
 {
 }

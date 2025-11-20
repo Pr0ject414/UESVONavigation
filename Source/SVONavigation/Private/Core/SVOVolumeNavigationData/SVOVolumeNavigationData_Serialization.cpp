@@ -24,6 +24,18 @@ void FSVOVolumeNavigationData::Serialize( FArchive & archive, const ESVOVersion 
 	archive << VolumeNavigationQueryFilter;
 	archive << bInNavigationDataChunk;
 
+	// Only serialize Portals if the file version supports it.
+	// This prevents the "Serial size mismatch" crash when loading older maps.
+	if (version >= ESVOVersion::PortalConnectivity)
+	{
+		archive << Portals;
+	}
+	else if (archive.IsLoading())
+	{
+		// Ensure a clean state for old maps
+		Portals.Reset();
+	}
+
 	if ( archive.IsSaving() )
 	{
 		const auto current_position = archive.Tell();

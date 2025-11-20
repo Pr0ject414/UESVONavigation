@@ -2,30 +2,31 @@ using UnrealBuildTool;
 
 public class SVONavigationEditor : ModuleRules
 {
-	public SVONavigationEditor(ReadOnlyTargetRules Target) : base(Target) {
+	public SVONavigationEditor(ReadOnlyTargetRules target) : base(target) {
 
-	    PublicDependencyModuleNames.AddRange( new string[] { 
+		PublicDependencyModuleNames.AddRange([
 			"Core", 
 			"CoreUObject", 
 			"Engine",  
 			"SVONavigation", 
-			"InputCore"
-		});
+			"InputCore",
+			"UnrealEd"
+		]);
 
-	    PrivateDependencyModuleNames.AddRange( new string[] { 
+		PrivateDependencyModuleNames.AddRange([
 			"Slate", 
 			"SlateCore", 
 			"PropertyEditor", 
 			"EditorStyle", 
-			"UnrealEd", 
 			"GraphEditor", 
-			"BlueprintGraph" 
-		});
+			"BlueprintGraph",
+			"SourceControl" // Required for PackageHelper
+		]);
 
-	    PrivateIncludePaths.AddRange( new string[] { 
+		PrivateIncludePaths.AddRange([
 			"SVONavigationEditor/Private"
-		} );
+		]);
 
-	    PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-    }
+		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+	}
 };

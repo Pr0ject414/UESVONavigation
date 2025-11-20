@@ -9,16 +9,20 @@
 #include <NavigationSystem.h>
 #include <EngineUtils.h>
 
+#include "Core/SVONavigationDataChunkActor.h"
+
 #if WITH_EDITOR
 #include <ObjectEditorUtils.h>
 #endif
 
 bool ASVONavigationData::NeedsRebuild() const
 {
+    // Check legacy monolithic data
     const auto needs_rebuild = VolumeNavigationData.FindByPredicate( []( const FSVOVolumeNavigationData & data ) {
         return !data.GetData().IsValid();
     } ) != nullptr;
 
+    // Check generator status
     if ( NavDataGenerator.IsValid() )
     {
         return needs_rebuild || NavDataGenerator->GetNumRemaningBuildTasks() > 0;
@@ -32,8 +36,8 @@ void ASVONavigationData::EnsureBuildCompletion()
     Super::EnsureBuildCompletion();
 
     // Doing this as a safety net solution due to UE-20646, which was basically a result of random
-    // over-releasing of default filter's shared pointer (it seemed). We might have time to get
-    // back to this time some time in next 3 years :D
+    // over-releasing of the default filter's shared pointer (it seemed). We might have time to get
+    // back to this time some time in the next 3 years:D
     RecreateDefaultFilter();
 }
 
@@ -123,18 +127,27 @@ void ASVONavigationData::ConditionalConstructGenerator()
 
 void ASVONavigationData::RemoveDataInBounds( const FBox & bounds )
 {
+    // Remove from the legacy monolithic array
     VolumeNavigationData.RemoveAllSwap( [ &bounds ]( const FSVOVolumeNavigationData & data ) {
         return data.GetVolumeBounds() == bounds;
     } );
+
+    // Note: We do NOT remove ChunkActors here. 
+    // ChunkActors manage their own lifecycle. If a rebuild happens, 
+    // the Generator will push new data into the existing ChunkActor.
 }
 
 void ASVONavigationData::AddVolumeNavigationData( FSVOVolumeNavigationData data )
 {
+    // Only used for Legacy/Non-WP flows.
+    // In WP flows, the Generator writes directly to the ChunkActor.
+    
     for ( TActorIterator< ASVOBoundsVolume > iterator( GetWorld(), ASVOBoundsVolume::StaticClass() ); iterator; ++iterator )
     {
         const auto * volume = *iterator;
 
-        if ( volume->GetComponentsBoundingBox( true ) == data.GetVolumeBounds() )
+        // Fuzzy compare bounds to find matching Volume Actor settings
+        if ( volume->GetComponentsBoundingBox( true ).Equals(data.GetVolumeBounds()) )
         {
             data.SetVolumeNavigationQueryFilter( volume->GetVolumeNavigationQueryFilter() );
             break;
@@ -170,6 +183,8 @@ void ASVONavigationData::OnNavigationDataUpdatedInBounds( const TArray< FBox > &
 void ASVONavigationData::ClearNavigationData()
 {
     VolumeNavigationData.Reset();
+    // Note: We generally don't destroy ChunkActors on clear, just their data, 
+    // but usually Clear is followed by Rebuild.
     RequestDrawingUpdate();
 }
 
@@ -189,8 +204,8 @@ void ASVONavigationData::InvalidateAffectedPaths( const TArray< FBox > & updated
     }
 
     // Paths can be registered from async pathfinding thread.
-    // Theoretically paths are invalidated synchronously by the navigation system
-    // before starting async queries task but protecting ActivePaths will make
+    // Theoretically, paths are invalidated synchronously by the navigation system
+    // before starting the async queries task, but protecting ActivePaths will make
     // the system safer in case of future timing changes.
     {
         FScopeLock path_lock( &ActivePathsLock );
@@ -209,7 +224,7 @@ void ASVONavigationData::InvalidateAffectedPaths( const TArray< FBox > & updated
                 const FNavigationPath * path = shared_path.Get();
                 if ( !path->IsReady() || path->GetIgnoreInvalidation() )
                 {
-                    // path not filled yet or doesn't care about invalidation
+                    // path hasn't filled yet or doesn't care about invalidation
                     continue;
                 }
 
@@ -243,77 +258,81 @@ void ASVONavigationData::OnNavigationDataGenerationFinished()
         {
 #if WITH_EDITOR
             // For navmeshes that support streaming create navigation data holders in each streaming level
-            // so parts of navmesh can be streamed in/out with those levels
             if ( !world->IsGameWorld() )
             {
-                const auto & levels = world->GetLevels();
-
-                for ( auto * level : levels )
+                // === UPDATED: World Partition Support ===
+                // If this is a World Partition world, we SKIP the legacy chunk injection.
+                // Instead, the Generator has already populated the ASVONavigationDataChunkActors,
+                // which serialize their own data.
+                if ( !world->IsPartitionedWorld() )
                 {
-                    if ( level->IsPersistentLevel() )
+                    const auto & levels = world->GetLevels();
+
+                    for ( auto * level : levels )
                     {
-                        continue;
-                    }
-
-                    USVONavigationDataChunk * navigation_data_chunk = GetNavigationDataChunk( level );
-
-                    if ( SupportsStreaming() )
-                    {
-                        // We use navigation volumes that belongs to this streaming level to find tiles we want to save
-                        const auto & level_nav_bounds = GetNavigableBoundsInLevel( level );
-
-                        TArray< int32 > navigation_data_indices;
-                        navigation_data_indices.Reserve( level_nav_bounds.Num() );
-
-                        for ( const auto & nav_bounds : level_nav_bounds )
+                        if ( level->IsPersistentLevel() )
                         {
-                            const auto index = VolumeNavigationData.IndexOfByPredicate( [ &nav_bounds ]( const FSVOVolumeNavigationData & data ) {
-                                const auto & bounds = data.GetData().GetVolumeBounds();
-                                return bounds == nav_bounds;
-                            } );
-
-                            if ( index != INDEX_NONE )
-                            {
-                                navigation_data_indices.Add( index );
-                            }
-                        }
-
-                        if ( navigation_data_indices.Num() > 0 )
-                        {
-                            // Create new chunk only if we have something to save in it
-                            if ( navigation_data_chunk == nullptr )
-                            {
-                                navigation_data_chunk = NewObject< USVONavigationDataChunk >( level );
-                                navigation_data_chunk->NavigationDataName = GetFName();
-                                level->NavDataChunks.Add( navigation_data_chunk );
-                            }
-
-                            for ( const auto index : navigation_data_indices )
-                            {
-                                navigation_data_chunk->AddNavigationData( VolumeNavigationData[ index ] );
-                            }
-
-                            navigation_data_chunk->MarkPackageDirty();
                             continue;
                         }
-                    }
 
-                    // It's hack. That check should not be there.
-                    // When calling FNavigationSystem::Build, all streaming levels should be loaded and visible for the navigation to be built. That's how it works for ReCast
-                    // But since svo nav data always resolves to a box bigger than the nav bounds volume, it's possible that when building navigation for a volume in a streaming
-                    // level, the box would encompasses geometry of another level which should not be visible.
-                    // The solution we use in our game is to use a BuildIncremental function on a custom navigation system, which never calls FNavigationSystem::DiscardNavigationDataChunks
-                    // In a commandlet we load streaming levels by batch, build navigation for those levels only, then load another batch of levels, build navigation for those levels, etc...
-                    // This means that this function ASVONavigationData::OnNavigationDataGenerationFinished is called after navigation is built for each batch of levels
-                    // and that also means that after the last batch of levels is processed, we would release the navigation data for each previous batch of levels
-                    if ( !IsRunningCommandlet() )
-                    {
-                        // stale data that is left in the level
-                        if ( navigation_data_chunk != nullptr )
+                        USVONavigationDataChunk * navigation_data_chunk = GetNavigationDataChunk( level );
+
+                        if ( SupportsStreaming() )
                         {
-                            navigation_data_chunk->ReleaseNavigationData();
-                            navigation_data_chunk->MarkPackageDirty();
-                            level->NavDataChunks.Remove( navigation_data_chunk );
+                            const auto & level_nav_bounds = GetNavigableBoundsInLevel( level );
+
+                            TArray< int32 > navigation_data_indices;
+                            navigation_data_indices.Reserve( level_nav_bounds.Num() );
+
+                            for ( const auto & nav_bounds : level_nav_bounds )
+                            {
+                                const auto index = VolumeNavigationData.IndexOfByPredicate( [ &nav_bounds ]( const FSVOVolumeNavigationData & data ) {
+                                    const auto & bounds = data.GetData().GetVolumeBounds();
+                                    return bounds == nav_bounds;
+                                } );
+
+                                if ( index != INDEX_NONE )
+                                {
+                                    navigation_data_indices.Add( index );
+                                }
+                            }
+
+                            if ( navigation_data_indices.Num() > 0 )
+                            {
+                                if ( navigation_data_chunk == nullptr )
+                                {
+                                    navigation_data_chunk = NewObject< USVONavigationDataChunk >( level );
+                                    navigation_data_chunk->NavigationDataName = GetFName();
+                                    level->NavDataChunks.Add( navigation_data_chunk );
+                                }
+
+                                for ( const auto index : navigation_data_indices )
+                                {
+                                    navigation_data_chunk->AddNavigationData( VolumeNavigationData[ index ] );
+                                }
+
+                                navigation_data_chunk->MarkPackageDirty();
+                                continue;
+                            }
+                        }
+
+                        // It's a hack. That check should not be there.
+                        // When calling FNavigationSystem::Build, all streaming levels should be loaded and visible for the navigation to be built. That's how it works for ReCast
+                        // But since svo nav data always resolves to a box bigger than the nav bounds volume, it's possible that when building navigation for a volume in a streaming
+                        // level, the box would encompass geometry of another level which should not be visible.
+                        // The solution we use in our game is to use a BuildIncremental function on a custom navigation system, which never calls FNavigationSystem::DiscardNavigationDataChunks
+                        // In a commandlet we load streaming levels by batch, build navigation for those levels only, then load another batch of levels, build navigation for those levels, etc...
+                        // This means that this function ASVONavigationData::OnNavigationDataGenerationFinished is called after navigation is built for each batch of levels,
+                        // and that also means that after the last batch of levels is processed, we would release the navigation data for each previous batch of levels
+                        if ( !IsRunningCommandlet() )
+                        {
+                            // stale data that is left in the level
+                            if ( navigation_data_chunk != nullptr )
+                            {
+                                navigation_data_chunk->ReleaseNavigationData();
+                                navigation_data_chunk->MarkPackageDirty();
+                                level->NavDataChunks.Remove( navigation_data_chunk );
+                            }
                         }
                     }
                 }
@@ -323,20 +342,34 @@ void ASVONavigationData::OnNavigationDataGenerationFinished()
             RequestDrawingUpdate( /*bForce=*/true );
 #endif // WITH_EDITOR
 
-            UNavigationSystemV1 * NavSys = FNavigationSystem::GetCurrent< UNavigationSystemV1 >( world );
-            if ( NavSys )
+            if ( UNavigationSystemV1 * NavSys = FNavigationSystem::GetCurrent< UNavigationSystemV1 >( world ) )
             {
                 NavSys->OnNavigationGenerationFinished( *this );
             }
 
+            // Update DataInfos for display in details panel
             DataInfos.Infos.Reset();
-
+            
+            // Add Legacy Data Infos
             for ( const auto & bounds_navigation_data : VolumeNavigationData )
             {
                 auto & navigation_data_infos = DataInfos.Infos.AddDefaulted_GetRef();
                 navigation_data_infos.VolumeLocation = bounds_navigation_data.GetVolumeBounds().GetCenter();
                 navigation_data_infos.LayerCount = bounds_navigation_data.GetData().GetLayerCount();
                 navigation_data_infos.bHasNavigationData = bounds_navigation_data.GetData().IsValid();
+            }
+
+            // Add World Partition Chunk Infos
+            for (const auto& Chunk : ChunkActors)
+            {
+                if (Chunk)
+                {
+                    const auto& ChunkData = Chunk->GetVolumeNavigationData();
+                    auto & navigation_data_infos = DataInfos.Infos.AddDefaulted_GetRef();
+                    navigation_data_infos.VolumeLocation = ChunkData.GetVolumeBounds().GetCenter();
+                    navigation_data_infos.LayerCount = ChunkData.GetData().GetLayerCount();
+                    navigation_data_infos.bHasNavigationData = ChunkData.GetData().IsValid();
+                }
             }
         }
     }

@@ -1,7 +1,6 @@
 #pragma once
 
-#include <CoreMinimal.h>
-#include <NavigationData.h>
+#include "CoreMinimal.h"
 
 #include "SVONavigationDataDetails.generated.h"
 
@@ -44,6 +43,9 @@ struct SVONAVIGATION_API FSVOVolumeNavigationDataDebugInfos
 
     UPROPERTY( EditInstanceOnly, meta = ( Tooltip = "Visualizes the pathfinding connections between nodes." ) )
     uint8 bDebugDrawNeighborLinks : 1;
+    
+    UPROPERTY( EditInstanceOnly, meta = ( Tooltip = "Draws the connectivity portals between chunks (Cyan Boxes). Essential for World Partition debugging." ) )
+    uint8 bDebugDrawPortals : 1;
 
     UPROPERTY( EditInstanceOnly, meta = ( Tooltip = "For a specific node address (e.g., '1 12 0'), shows its neighbor links." ) )
     FString NeighborLinksForNodeAddress;

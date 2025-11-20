@@ -7,9 +7,17 @@ bool ASVONavigationData::SupportsStreaming() const
     return ( RuntimeGeneration != ERuntimeGenerationType::Dynamic );
 }
 
-void ASVONavigationData::OnStreamingLevelAdded( ULevel * level, UWorld * /*world*/ )
+void ASVONavigationData::OnStreamingLevelAdded( ULevel * level, UWorld * world )
 {
     // QUICK_SCOPE_CYCLE_COUNTER( STAT_RecastNavMesh_OnStreamingLevelAdded );
+
+    // === UPDATED: World Partition Support ===
+    // In World Partition, streaming is handled via ASVONavigationDataChunkActor registration.
+    // We skip the legacy "Level->NavDataChunks" logic if we detect WP or if chunk actors are active.
+    if ( world && world->IsPartitionedWorld() )
+    {
+        return;
+    }
 
     if ( SupportsStreaming() )
     {
@@ -30,9 +38,15 @@ void ASVONavigationData::OnStreamingLevelAdded( ULevel * level, UWorld * /*world
     }
 }
 
-void ASVONavigationData::OnStreamingLevelRemoved( ULevel * level, UWorld * /*world*/ )
+void ASVONavigationData::OnStreamingLevelRemoved( ULevel * level, UWorld * world )
 {
     // QUICK_SCOPE_CYCLE_COUNTER( STAT_RecastNavMesh_OnStreamingLevelRemoved );
+
+    // === UPDATED: World Partition Support ===
+    if ( world && world->IsPartitionedWorld() )
+    {
+        return;
+    }
 
     if ( SupportsStreaming() )
     {
@@ -56,6 +70,9 @@ void ASVONavigationData::CheckToDiscardSubLevelNavData( const UNavigationSystemB
     {
         if ( const auto * nav_sys = Cast< UNavigationSystemV1 >( &navigation_system ) )
         {
+            // In World Partition, sublevel discarding logic might not apply the same way,
+            // but we keep this for standard level streaming safety.
+            
             // Get rid of instances saved within levels that are streamed-in
             if ( GEngine->IsSettingUpPlayWorld() == false // this is a @HACK
                  && ( world->PersistentLevel != GetLevel() )
